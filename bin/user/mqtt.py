@@ -22,6 +22,7 @@ Other MQTT options can be specified:
         ...
         qos = 1        # options are 0, 1, 2
         retain = true  # options are true or false
+        publish_availability = true # options are true or false
 
 The observations can be sent individually, or in an aggregated packet:
 
@@ -259,6 +260,7 @@ class MQTT(weewx.restx.StdRESTbase):
         site_dict.setdefault('retain', False)
         site_dict.setdefault('qos', 0)
         site_dict.setdefault('aggregation', 'individual,aggregate')
+        site_dict.setdefault('publish_availability', False)
 
         usn = site_dict.get('unit_system', None)
         if usn is not None:
@@ -277,6 +279,7 @@ class MQTT(weewx.restx.StdRESTbase):
         site_dict['augment_record'] = to_bool(site_dict.get('augment_record'))
         site_dict['retain'] = to_bool(site_dict.get('retain'))
         site_dict['qos'] = to_int(site_dict.get('qos'))
+        site_dict['publish_availability'] = to_bool(site_dict.get('publish_availability'))
         binding = site_dict.pop('binding', 'archive')
         loginf("binding to %s" % binding)
 
@@ -314,6 +317,11 @@ class MQTT(weewx.restx.StdRESTbase):
 
     def new_loop_packet(self, event):
         self.archive_queue.put(event.packet)
+
+    # override shutDown to post clean MQTT disconnect message.
+    def shutDown(self):
+        self.archive_queue.put({"mqtt_stop": True, "dateTime": time.time()})
+        super().shutDown()
 
 
 class TLSDefaults(object):
@@ -381,6 +389,7 @@ class MQTTThread(weewx.restx.RESTThread):
                  post_interval=None, stale=None,
                  log_success=True, log_failure=True,
                  timeout=60, max_tries=3, retry_wait=5,
+                 publish_availability=False,
                  max_backlog=sys.maxsize):
         super(MQTTThread, self).__init__(queue,
                                          protocol_name='MQTT',
@@ -422,6 +431,8 @@ class MQTTThread(weewx.restx.RESTThread):
         self.skip_upload = skip_upload
         self.mc = None
         self.mc_try_time = 0
+        self.publish_availability = publish_availability
+        self.stopped = False
 
     def get_mqtt_client(self):
         if self.mc:
@@ -439,6 +450,10 @@ class MQTTThread(weewx.restx.RESTThread):
         # if we have TLS opts configure TLS on our broker connection
         if len(self.tls_dict) > 0:
             mc.tls_set(**self.tls_dict)
+
+        if self.publish_availability:
+            mc.will_set(f'{self.topic}/availability', 'offline', retain=True)
+
         try:
             self.mc_try_time = time.time()
             mc.connect(url.hostname, url.port)
@@ -451,6 +466,9 @@ class MQTTThread(weewx.restx.RESTThread):
         loginf('client established for %s' %
                _obfuscate_password(self.server_url))
         self.mc = mc
+
+        if self.publish_availability:
+            self._set_online(True)
 
     def filter_data(self, record):
         # if uploading everything, we must check the upload variables list
@@ -500,6 +518,8 @@ class MQTTThread(weewx.restx.RESTThread):
         return data
 
     def process_record(self, record, dbm):
+        if self._handle_stop_message(record):
+            return
         if self.augment_record and dbm is not None:
             record = self.get_record(record, dbm)
         if self.unit_system is not None:
@@ -528,3 +548,28 @@ class MQTTThread(weewx.restx.RESTThread):
                 if res != mqtt.MQTT_ERR_SUCCESS:
                     logerr("publish failed for %s: %s" %
                            (tpc, mqtt.error_string(res)))
+
+    def _handle_stop_message(self, record):
+        if self.stopped:
+            return True
+
+        if not record.get('mqtt_stop'):
+            return False
+
+        # we're stopped
+        self.stopped = True
+        if not self.mc:
+            return True
+
+        loginf('notifying MQTT of shutdown')
+        msg = self._set_online(False)
+        msg.wait_for_publish()
+        self.mc.loop_stop()
+        self.mc.disconnect()
+        self.mc = None
+        return True
+
+    def _set_online(self, online):
+        state = 'online' if online else 'offline'
+        if self.mc:
+            return self.mc.publish(f'{self.topic}/availability', state, retain=True)
