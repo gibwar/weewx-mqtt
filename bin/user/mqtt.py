@@ -88,6 +88,75 @@ Paho client tls_set method.  Refer to Paho client documentation for details:
             #   To specify multiple cyphers, delimit with commas and enclose
             #   in quotes.
             #ciphers =
+
+Home Assistant configuration
+
+MQTT discovery configuration is available through some extra configuration parameters.
+Due to the nature of not every sensor being useful in HA beyond weewx there is the need
+to provide a list of sensors you want to show up in HA. There is interaction with
+obs_to_upload and the input dictionary used for regular MQTT configuration. If you have
+obs_to_upload to a value other than "all" a sensor must be added to both the [[[input]]]
+AND [[[[Sensors]]]] dictionaries.
+
+An optional Device configuration is available if you would like to fill out extra device
+information related to the sensors.
+
+[StdRestful]
+    [[MQTT]]
+        unit_system = US  # required for Home Assistant
+        publish_availability = true  # highly recommended for good HA interaction
+
+        [[[HomeAssistant]]]
+            enable = true
+            # HA topic to post discovery data to. Optional. Defaults to homeassistant
+            topic = homeassistant
+            # string value to prepend to all sensors to help ensure uniqueness.
+            # Optional. Defaults to "weewx"
+            sensor_prefix = vantagepro2
+
+            [[[[Device]]]]
+                configuration_url = https://example.com/wx
+                # suggested to set this if using more than one weewx instance, default
+                # is "weewx"
+                identifier = weewx_vantagepro2
+                manufacturer = Davis Instruments
+                model = Vantage Pro2
+                name = Davis Vantage Pro2
+                suggested_area = Outside
+                sw_version = 3.88
+
+            [[[[Sensors]]]]
+                [[[[[outTemp]]]]]
+                    name = Outside Temperature  # required
+                [[[[[barometer]]]]]
+                    name = Barometric Pressure
+                [[[[[rain]]]]]
+                    name = Rain
+                    icon = mdi:weather-rainy
+                [[[[[rxCheckPercent]]]]]
+                    name = RX %
+                    icon = mdi:radio-handheld
+                    entity_category = diagnostic
+
+Device and Sensor override values are available at:
+    https://www.home-assistant.io/integrations/sensor.mqtt/#configuration-variables
+
+The Device dictionary is a direct map to the configuration linked above and no
+additional processing is done. Each Sensor can override the values, though an attempt
+has been made to minimize the amount of configuration needed and sane default values are
+provided for the sensors (ie: temperature and pressure).
+
+The only required sensor value is "name", all others can override the defaults if
+needed. Available overrides for sensors are:
+    - unit_of_measurement (a basic unit map is provided below with a few defaults)
+    - device_class (this has limited utility outside of temperature and pressure which
+      are already handled)
+    - value_template
+    - object_id (useful if you decide to change the name of the device, otherwise the
+      default value is sufficient)
+    - icon (very handy to have sensors show up with the requested icon, though that can
+      still be done through the UI later)
+    - entity_category (used to move sensors to "diagnostic")
 """
 
 try:
@@ -261,6 +330,7 @@ class MQTT(weewx.restx.StdRESTbase):
         site_dict.setdefault('qos', 0)
         site_dict.setdefault('aggregation', 'individual,aggregate')
         site_dict.setdefault('publish_availability', False)
+        site_dict.setdefault('ha', {})
 
         usn = site_dict.get('unit_system', None)
         if usn is not None:
@@ -274,6 +344,9 @@ class MQTT(weewx.restx.StdRESTbase):
             # In the 'inputs' section, option 'units' is now 'unit'.
             for obs_type in site_dict['inputs']:
                 _compat(site_dict['inputs'][obs_type], 'units', 'unit')
+
+        if 'HomeAssistant' in config_dict['StdRESTful']['MQTT']:
+            site_dict['ha'] = dict(config_dict['StdRESTful']['MQTT']['HomeAssistant'])
 
         site_dict['append_units_label'] = to_bool(site_dict.get('append_units_label'))
         site_dict['augment_record'] = to_bool(site_dict.get('augment_record'))
@@ -389,7 +462,7 @@ class MQTTThread(weewx.restx.RESTThread):
                  post_interval=None, stale=None,
                  log_success=True, log_failure=True,
                  timeout=60, max_tries=3, retry_wait=5,
-                 publish_availability=False,
+                 publish_availability=False, ha={},
                  max_backlog=sys.maxsize):
         super(MQTTThread, self).__init__(queue,
                                          protocol_name='MQTT',
@@ -433,6 +506,7 @@ class MQTTThread(weewx.restx.RESTThread):
         self.mc_try_time = 0
         self.publish_availability = publish_availability
         self.stopped = False
+        self.ha = ha
 
     def get_mqtt_client(self):
         if self.mc:
@@ -469,6 +543,9 @@ class MQTTThread(weewx.restx.RESTThread):
 
         if self.publish_availability:
             self._set_online(True)
+
+        if self.ha.get('enable'):
+            self._publish_ha_config()
 
     def filter_data(self, record):
         # if uploading everything, we must check the upload variables list
@@ -549,6 +626,38 @@ class MQTTThread(weewx.restx.RESTThread):
                     logerr("publish failed for %s: %s" %
                            (tpc, mqtt.error_string(res)))
 
+    def _get_ha_config_template(self):
+        device = self.ha.get('Device', {})
+        device_conf = {
+            'identifiers': [ device.get('identifier', 'weewx') ]
+        }
+
+        if 'configuration_url' in device:
+            device_conf['configuration_url'] = str(device['configuration_url'])
+        if 'manufacturer' in device:
+            device_conf['manufacturer'] = str(device['manufacturer'])
+        if 'model' in device:
+            device_conf['model'] = str(device['model'])
+        if 'name' in device:
+            device_conf['name'] = str(device['name'])
+        if 'suggested_area' in device:
+            device_conf['suggested_area'] = str(device['suggested_area'])
+        if 'sw_version' in device:
+            device_conf['sw_version'] = str(device['sw_version'])
+
+        default_config = {
+            'device': device_conf,
+            'enabled_by_default': True,
+        }
+
+        if self.publish_availability:
+            default_config['availability'] = [{
+                'topic': f'{self.topic}/availability',
+            }]
+            default_config['availability_mode'] = 'all'
+
+        return default_config
+
     def _handle_stop_message(self, record):
         if self.stopped:
             return True
@@ -569,7 +678,99 @@ class MQTTThread(weewx.restx.RESTThread):
         self.mc = None
         return True
 
+    def _publish_ha_config(self):
+        loginf('publishing home assistant configuration')
+        sensors = self.ha.get('Sensors')
+        if not sensors:
+            logerr('missing Sensor configuration in Home Assistant')
+            return
+
+        if not self.unit_system:
+            logerr('missing unit system. this is needed to ensure Home Assistant has the right sensor configuration')
+            return
+
+        config_template = self._get_ha_config_template()
+        prefix = self.ha.get('sensor_prefix', 'weewx')
+
+        for (key, sensor) in sensors.items():
+            (weewx_unit, group) = weewx.units.getStandardUnitType(self.unit_system, key)
+            template = _get_template(key, self.inputs.get(key, {}), self.append_units_label, self.unit_system)
+
+            unit_of_measurement = sensor.get('unit_of_measurement', HA_UNIT_MAP.get(weewx_unit, weewx_unit))
+            device_class = sensor.get('device_class', HA_DEVICE_CLASS_MAP.get(group))
+            value_template = sensor.get('value_template', HA_VALUE_MAP.get(self.unit_system, {}).get(group))
+
+            object_id = sensor.get('object_id', sensor['name'])
+            object_id = object_id.strip().replace(' ', '_').lower()
+
+            sensor_config = dict(config_template)
+            sensor_config.update({
+                'name': sensor['name'],
+                'object_id': f'{prefix}_{object_id}',
+                'state_class': 'measurement',
+                'state_topic': f'{self.topic}/{template.get("name", key)}',
+                'unique_id': f'{prefix}_{key}_mqtt',
+            })
+
+            if device_class:
+                sensor_config['device_class'] = device_class
+            if unit_of_measurement:
+                sensor_config['unit_of_measurement'] = unit_of_measurement
+            if value_template:
+                sensor_config['value_template'] = value_template
+
+            if 'icon' in sensor:
+                sensor_config['icon'] = sensor['icon']
+            if 'entity_category' in sensor:
+                sensor_config['entity_category'] = sensor['entity_category']
+
+
+            ha_topic = self.ha.get('topic', 'homeassistant')
+            data = json.dumps(sensor_config)
+            self.mc.publish(f'{ha_topic}/sensor/{prefix}/{key}/config', data, retain=True)
+
     def _set_online(self, online):
         state = 'online' if online else 'offline'
         if self.mc:
             return self.mc.publish(f'{self.topic}/availability', state, retain=True)
+
+
+HA_DEVICE_CLASS_MAP = {
+    'group_pressure': 'pressure',
+    'group_temperature': 'temperature',
+}
+
+HA_UNIT_MAP = {
+    'degree_C': '°C',
+    'degree_F': '°F',
+    'degree_compass': '°',
+    'inch': 'in',
+    'km_per_hour': 'kph',
+    'mile_per_hour': 'mph',
+    'percent': '%',
+    'uv_index': 'UV',
+    'watt_hour': 'Wh',
+    'watt_per_meter_squared': 'Wpm²',
+    'watt_second': 'Ws',
+}
+
+HA_VALUE_MAP = {
+    weewx.US: {
+        'group_percent': '{{ value | int }}',
+        'group_pressure': '{{ value | float(default=0) | round(2) }}',
+        'group_rain': '{{ value | float(default=0) | round(3) }}',
+        'group_temperature': '{{ value | float(default=0) }}',
+    },
+    weewx.METRIC: {
+        'group_percent': '{{ value | int }}',
+        'group_pressure': '{{ value | float(default=0) }}',
+        'group_rain': '{{ value | float(default=0) }}',
+        'group_temperature': '{{ value | float(default=0) }}',
+    },
+    weewx.METRICWX: {
+        'group_percent': '{{ value | int }}',
+        'group_pressure': '{{ value | float(default=0) }}',
+        'group_rain': '{{ value | float(default=0) }}',
+        'group_temperature': '{{ value | float(default=0) }}',
+    },
+}
